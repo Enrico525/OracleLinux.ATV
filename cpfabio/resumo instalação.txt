@@ -1,0 +1,32 @@
+﻿Resumo Executivo: Hardening e Estruturação do Sistema
+1. Particionamento Seguro com LVM sobre LUKS2
+    • Objetivo: Garantir criptografia de dados em repouso (data-at-rest) e flexibilidade no gerenciamento de volumes de disco.
+    • O que foi feito:
+        ◦ O sistema foi instalado utilizando LUKS2 na partição base (/dev/sda3).
+        ◦ Por cima da camada criptografada, criamos o Volume Group vg_sistema.
+        ◦ Reservamos 10 GB livres no vg_sistema sem alocar para permitir a criação futura de snapshots LVM antes de atualizações ou alterações críticas.
+2. Criação da Pasta e Arquivos de Evidências (/root/evidencias/)
+    • Objetivo: Manter a rastreabilidade e comprovação técnica de cada configuração do servidor para versionamento no Git do grupo.
+    • O que foi feito:
+        ◦ Criamos a pasta /root/evidencias/.
+        ◦ Redirecionamos saídas do terminal para arquivos .txt:
+            ▪ 01-layout-disco.txt: Mapeamento das partições e UUIDs (lsblk -f, fdisk).
+            ▪ 02-lvm-detalhes.txt: Mapeamento dos Physical Volumes, Volume Groups e Logical Volumes (pvs, vgs, lvs).
+            ▪ 03-luks-status.txt: Cabeçalho do container para comprovação do padrão LUKS2 (cryptsetup luksDump /dev/sda3).
+3. Hardening de Opções de Montagem de Sistemas de Arquivos (/etc/fstab)
+    • Objetivo: Impedir a execução de binários maliciosos ou elevação indesejada de privilégios em diretórios temporários e de usuários.
+    • O que foi feito:
+        ◦ Realizamos o backup preventivo do arquivo (/etc/fstab.bak).
+        ◦ Aplicamos as seguintes restrições de montagem no /etc/fstab:
+            ▪ /tmp e /var/tmp (defaults,nodev,nosuid,noexec): Bloqueia criação de dispositivos de bloco/caractere (nodev), ignora bits SUID/SGID (nosuid) e impede a execução direta de binários/scripts (noexec).
+            ▪ /home (defaults,nodev,nosuid): Impede a criação de dispositivos e privilégios SUID em pastas de usuários comuns.
+            ▪ /var/log (defaults,nodev,nosuid,noexec): Isola os diretórios de logs contra execução de arquivos.
+            ▪ /var (defaults,nodev): Garante que a árvore /var não contenha dispositivos especiais não autorizados.
+        ◦ Testamos e validamos o arquivo sem reinicialização com o comando mount -a.
+        ◦ Atualizamos a evidência final no arquivo 04-fstab-config.txt.
+Tópicos Prontos para Apresentar nos Slides
+Se precisar expor de forma rápida para os professores ou colegas, diga:
+    1. Criptografia & Particionamento: "Instalamos o Oracle Linux 9.8 usando LUKS2 para criptografia completa do disco e LVM para flexibilidade de volumes, deixando 10GB reservados para Snapshots."
+    2. Hardening de Armazenamento: "Editamos o /etc/fstab aplicando as flags nodev, nosuid e noexec em pontos críticos como /tmp, /home e /var/tmp para mitigar ataques de execução de código local e elevação de privilégio."
+    3. Auditabilidade & Evidências: "Gerações automatizadas de logs do sistema foram salvas em /root/evidencias/ para comprovação de compliance e versionamento no Git."
+

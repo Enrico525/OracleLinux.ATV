@@ -1,6 +1,6 @@
 README
 
-Este documento é importante porque descrever as credenciais do sistema e fala um pouco do funcionamento do script.
+Este documento é importante porque mostra as credenciais do sistema e fala um pouco do funcionamento do script.
 
 -----=====Credenciais=====-----
 
@@ -12,7 +12,6 @@ Chave passphrase: @CPfabioLAB2026
 Senha da chave privada SSH: @PVfabio
 
 ===============================
-
 
 
 ------========Script========-------

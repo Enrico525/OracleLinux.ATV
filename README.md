@@ -43,13 +43,4 @@ local do arquivo= /usr/local/sbin
 
 *Use esse comando abaixo para se informar sobre os parâmetros do script:
 sudo /usr/local/sbin/net-hardening.sh -h
-
-
-
-ShellCheck → sem erros
-bash -n → OK
---dry-run → código 0
-execução real → código 0
---restore → código 0
-SSH port:2222 → preservado
 ==================================

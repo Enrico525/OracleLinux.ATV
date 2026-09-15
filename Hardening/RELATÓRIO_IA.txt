@@ -1,0 +1,11 @@
+RELATÓRIO IA
+
+Esse documento diz respeito a utilização da IA no processo da criação do script e da configuração do SSH.
+
+IA utilizada: ChatGPT(OpenIA)
+
+===SCRIPT===
+Usada para padronizar, organizar, otimizar e corrigir erros no código.
+
+====SSH=====
+Usada como apoio e guia, para configurar o ssh e atender aos requisitos do trabalho.

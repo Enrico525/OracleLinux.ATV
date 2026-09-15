@@ -1,0 +1,483 @@
+#!/bin/bash
+set -euo pipefail
+
+# ============================================================
+# net-hardening.sh
+# Hardening de rede e firewalld
+# ============================================================
+
+readonly LOG_FILE="/var/log/net-hardening.log"
+readonly SYSCTL_FILE="/etc/sysctl.d/99-net-hardening.conf"
+readonly BACKUP_DIR="/var/lib/net-hardening"
+readonly ALLOWED_FILE="/etc/net-hardening-allowed-ports.conf"
+readonly FIREWALL_ZONE="public"
+readonly RATE_LIMIT="10/m"
+
+DRY_RUN=false
+RESTORE=false
+TMP_FILE=""
+SSH_PORT=""
+FIREWALL_ZONE_ATIVA=""
+
+registrar_log() {
+    local nivel="$1"
+    local mensagem="$2"
+
+    printf '%s [%s] %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$nivel" \
+        "$mensagem" >> "$LOG_FILE"
+}
+
+mostrar_ajuda() {
+    cat <<'EOF2'
+Uso:
+  net-hardening.sh [opção]
+
+Opções:
+  -h, --help       Exibe esta ajuda
+  -n, --dry-run    Mostra o que seria alterado sem aplicar mudanças
+  -r, --restore    Restaura o sysctl salvo no backup
+
+Arquivo de portas autorizadas:
+  /etc/net-hardening-allowed-ports.conf
+
+Formato:
+  tcp 2222
+  tcp 9090
+
+Códigos de saída:
+  0  Sucesso
+  1  Achado
+  2  Erro de uso ou operação inválida
+  3  Dependência ausente
+EOF2
+}
+
+ler_opcoes() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                mostrar_ajuda
+                exit 0
+                ;;
+            -n|--dry-run)
+                if [[ "$DRY_RUN" == true ]]; then
+                    printf 'ERRO: --dry-run informado mais de uma vez.\n' >&2
+                    exit 2
+                fi
+                DRY_RUN=true
+                ;;
+            -r|--restore)
+                if [[ "$RESTORE" == true ]]; then
+                    printf 'ERRO: --restore informado mais de uma vez.\n' >&2
+                    exit 2
+                fi
+                RESTORE=true
+                ;;
+            *)
+                printf 'ERRO: opção inválida: %s\n' "$1" >&2
+                mostrar_ajuda
+                exit 2
+                ;;
+        esac
+        shift
+    done
+
+    if [[ "$DRY_RUN" == true && "$RESTORE" == true ]]; then
+        printf 'ERRO: --dry-run não pode ser usado com --restore.\n' >&2
+        exit 2
+    fi
+}
+
+validar_root() {
+    if [[ "$EUID" -ne 0 ]]; then
+        printf 'ERRO: execute este script como root.\n' >&2
+        exit 2
+    fi
+}
+
+validar_comandos() {
+    local comando
+    local comandos=(
+        awk
+        bash
+        cat
+        cp
+        date
+        diff
+        firewall-cmd
+        grep
+        mkdir
+        mktemp
+        rm
+        sort
+        ss
+        sysctl
+        touch
+    )
+
+    for comando in "${comandos[@]}"; do
+        if ! command -v "$comando" >/dev/null 2>&1; then
+            printf 'ERRO: dependência ausente: %s\n' "$comando" >&2
+            exit 3
+        fi
+    done
+}
+
+preparar_ambiente() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+
+    mkdir -p "$BACKUP_DIR"
+
+    TMP_FILE="$(mktemp)"
+
+    if [[ ! -f "$ALLOWED_FILE" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            registrar_log "WARN" \
+                "Lista de portas autorizadas ausente: $ALLOWED_FILE"
+        else
+            cat > "$ALLOWED_FILE" <<'EOF2'
+# Portas autorizadas pelo hardening de rede.
+# Formato: protocolo porta
+# Ajuste esta lista conforme os serviços realmente autorizados.
+tcp 2222
+EOF2
+            chmod 600 "$ALLOWED_FILE"
+            registrar_log "WARN" \
+                "Lista de portas autorizadas criada: $ALLOWED_FILE"
+        fi
+    fi
+}
+# shellcheck disable=SC2329
+limpar_temporario() {
+    if [[ -n "$TMP_FILE" && -f "$TMP_FILE" ]]; then
+        rm -f "$TMP_FILE"
+    fi
+}
+
+guardar_backup() {
+    local arquivo="$1"
+    local backup
+
+    if [[ ! -f "$arquivo" ]]; then
+        return 0
+    fi
+
+    backup="${BACKUP_DIR}/$(basename "$arquivo").bak"
+
+    if [[ ! -f "$backup" ]]; then
+        cp "$arquivo" "$backup"
+        registrar_log "INFO" "Backup criado: $backup"
+    else
+        registrar_log "INFO" "Backup existente preservado: $backup"
+    fi
+}
+
+sysctl_esta_configurado() {
+    local configuracao="$1"
+
+    [[ -f "$SYSCTL_FILE" ]] || return 1
+
+    diff -u <(printf '%s\n' "$configuracao") "$SYSCTL_FILE" \
+        >/dev/null 2>&1
+}
+
+extrair_portas_ss() {
+    awk '
+        NR > 1 {
+            protocolo = $1
+            endereco = $5
+
+            if (endereco ~ /]:[0-9]+$/) {
+                sub(/^.*]:/, "", endereco)
+            } else {
+                sub(/^.*:/, "", endereco)
+            }
+
+            if (endereco ~ /^[0-9]+$/) {
+                print protocolo "\t" endereco
+            }
+        }
+    ' "$TMP_FILE" | sort -u
+}
+
+verificar_portas() {
+    local encontrou=false
+    local protocolo
+    local porta
+
+    registrar_log "INFO" "Consultando portas em escuta com ss -tulpn."
+    ss -tulpn > "$TMP_FILE"
+
+    if [[ ! -s "$ALLOWED_FILE" ]]; then
+        registrar_log "WARN" \
+            "A lista de portas autorizadas está vazia: $ALLOWED_FILE"
+        return 1
+    fi
+
+    while IFS=$'\t' read -r protocolo porta; do
+        [[ -z "$porta" ]] && continue
+
+        if ! grep -Eq \
+            "^[[:space:]]*${protocolo}[[:space:]]+${porta}([[:space:]]|$)" \
+            "$ALLOWED_FILE"; then
+            registrar_log "WARN" \
+                "Porta não autorizada encontrada: ${protocolo}/${porta}."
+            encontrou=true
+        fi
+    done < <(extrair_portas_ss)
+
+    if [[ "$encontrou" == true ]]; then
+        return 1
+    fi
+
+    registrar_log "INFO" \
+        "Portas em escuta estão de acordo com a lista autorizada."
+    return 0
+}
+
+aplicar_sysctl() {
+    local configuracao
+
+    configuracao=$(
+        cat <<'EOF2'
+# Parâmetros de hardening de rede
+net.ipv4.ip_forward=0
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+EOF2
+    )
+
+    registrar_log "INFO" "Conferindo parâmetros de rede do sysctl."
+
+    if sysctl_esta_configurado "$configuracao"; then
+        registrar_log "INFO" "Parâmetros do sysctl já estão configurados."
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        registrar_log "INFO" \
+            "Dry-run: $SYSCTL_FILE seria atualizado."
+        return 0
+    fi
+
+    guardar_backup "$SYSCTL_FILE"
+    printf '%s\n' "$configuracao" > "$SYSCTL_FILE"
+    sysctl --system >/dev/null
+
+    registrar_log "INFO" \
+        "Parâmetros de rede persistidos em $SYSCTL_FILE."
+}
+
+descobrir_zona() {
+    local zona
+
+    zona="$(firewall-cmd --get-active-zones | awk 'NR == 1 {print $1}')"
+
+    if [[ -z "$zona" ]]; then
+        zona="$FIREWALL_ZONE"
+        registrar_log "WARN" \
+            "Nenhuma zona ativa encontrada; utilizando a zona $zona."
+    fi
+
+    printf '%s\n' "$zona"
+}
+
+descobrir_porta_ssh() {
+    local porta_ssh
+
+    porta_ssh="$(
+        ss -tnlp |
+            awk '
+                /sshd/ {
+                    endereco = $4
+
+                    if (endereco ~ /]:[0-9]+$/) {
+                        sub(/^.*]:/, "", endereco)
+                    } else {
+                        sub(/^.*:/, "", endereco)
+                    }
+
+                    if (endereco ~ /^[0-9]+$/) {
+                        print endereco
+                        exit
+                    }
+                }
+            '
+    )"
+
+    if [[ -z "$porta_ssh" ]]; then
+        porta_ssh="22"
+        registrar_log "WARN" \
+            "Não foi possível detectar a porta do sshd; usando 22 como proteção."
+    fi
+
+    printf '%s\n' "$porta_ssh"
+}
+
+regra_rich_ssh() {
+    local porta="$1"
+
+    printf '%s\n' \
+        "rule family=\"ipv4\" port port=\"${porta}\" protocol=\"tcp\" limit value=\"${RATE_LIMIT}\" accept"
+}
+
+porta_eh_sessao_ssh() {
+    local porta="$1"
+
+    [[ "$porta" == "$SSH_PORT" ]]
+}
+
+remover_servico_ssh_seguro() {
+    local zona="$1"
+
+    # O serviço 'ssh' representa a porta 22 no firewalld.
+    # Nunca removemos essa regra se o sshd atual estiver usando 22.
+    if porta_eh_sessao_ssh "22"; then
+        registrar_log "WARN" \
+            "Proteção: a porta 22 sustenta o sshd atual; regra não será removida."
+        return 0
+    fi
+
+    if firewall-cmd --permanent --zone="$zona" \
+        --query-service=ssh >/dev/null 2>&1; then
+        if [[ "$DRY_RUN" == true ]]; then
+            registrar_log "INFO" \
+                "Dry-run: serviço SSH (porta 22) seria removido da zona $zona."
+            return 0
+        fi
+
+        firewall-cmd --permanent --zone="$zona" \
+            --remove-service=ssh >/dev/null
+        registrar_log "INFO" \
+            "Serviço SSH (porta 22) removido da zona $zona."
+    fi
+}
+
+aplicar_firewalld() {
+    local zona="$FIREWALL_ZONE_ATIVA"
+    local regra_limite
+
+    registrar_log "INFO" "Conferindo o estado do firewalld."
+
+    if ! firewall-cmd --state >/dev/null 2>&1; then
+        registrar_log "ERROR" "O firewalld não está ativo."
+        exit 2
+    fi
+
+    SSH_PORT="$(descobrir_porta_ssh)"
+    regra_limite="$(regra_rich_ssh "$SSH_PORT")"
+
+    registrar_log "INFO" "Zona utilizada: $zona."
+    registrar_log "INFO" "Porta SSH detectada: $SSH_PORT."
+
+    if [[ "$DRY_RUN" == true ]]; then
+        registrar_log "INFO" \
+            "Dry-run: nenhuma alteração real será aplicada ao firewalld."
+        registrar_log "INFO" \
+            "Rich rule prevista: limite de ${RATE_LIMIT} para SSH em ${SSH_PORT}/tcp."
+        remover_servico_ssh_seguro "$zona"
+        return 0
+    fi
+
+    # Remove somente o serviço SSH padrão (porta 22) quando ele não é
+    # a porta da sessão atual. A porta da própria sessão nunca é removida.
+    remover_servico_ssh_seguro "$zona"
+
+    # Se a porta SSH estiver explicitamente aberta como port rule, ela é a
+    # regra que sustenta a sessão e, portanto, NÃO será removida pelo script.
+    if firewall-cmd --permanent --zone="$zona" \
+        --query-port="${SSH_PORT}/tcp" >/dev/null 2>&1; then
+        registrar_log "WARN" \
+            "Proteção: ${SSH_PORT}/tcp é a porta da sessão SSH; regra existente não será removida."
+    fi
+
+    if ! firewall-cmd --permanent --zone="$zona" \
+        --query-rich-rule="$regra_limite" >/dev/null 2>&1; then
+        firewall-cmd --permanent --zone="$zona" \
+            --add-rich-rule="$regra_limite" >/dev/null
+        registrar_log "INFO" \
+            "Rich rule de limite adicionada para ${SSH_PORT}/tcp."
+    else
+        registrar_log "INFO" \
+            "Rich rule de limite já estava configurada para ${SSH_PORT}/tcp."
+    fi
+
+    firewall-cmd --reload >/dev/null
+
+    registrar_log "INFO" \
+        "Firewalld recarregado com segurança."
+    registrar_log "INFO" \
+        "A regra que sustenta a sessão SSH não foi removida."
+}
+
+restaurar_configuracao() {
+    local backup_sysctl
+    backup_sysctl="${BACKUP_DIR}/$(basename "$SYSCTL_FILE").bak"
+
+    if [[ ! -f "$backup_sysctl" ]]; then
+        registrar_log "ERROR" \
+            "Backup do sysctl não encontrado: $backup_sysctl"
+        exit 2
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        registrar_log "INFO" \
+            "Dry-run: nenhuma restauração será aplicada."
+        return 0
+    fi
+
+    cp "$backup_sysctl" "$SYSCTL_FILE"
+    sysctl --system >/dev/null
+
+    registrar_log "INFO" \
+        "Configuração anterior do sysctl restaurada."
+    registrar_log "INFO" \
+        "Backup utilizado: $backup_sysctl."
+    registrar_log "WARN" \
+        "Regras do firewalld não foram removidas automaticamente para evitar perda da sessão SSH."
+}
+
+executar_hardening() {
+    local resultado_portas=0
+
+    ler_opcoes "$@"
+    validar_root
+    validar_comandos
+    preparar_ambiente
+
+    trap limpar_temporario EXIT
+
+    if [[ "$RESTORE" == true ]]; then
+        restaurar_configuracao
+        registrar_log "INFO" "Restauração concluída."
+        exit 0
+    fi
+
+    FIREWALL_ZONE_ATIVA="$(descobrir_zona)"
+
+    verificar_portas || resultado_portas=$?
+    aplicar_sysctl
+    aplicar_firewalld
+
+    if [[ "$resultado_portas" -eq 1 ]]; then
+        registrar_log "WARN" \
+            "Foram encontradas portas fora da política autorizada."
+        exit 1
+    fi
+
+    registrar_log "INFO" \
+        "Hardening de rede concluído com sucesso."
+    exit 0
+}
+
+executar_hardening "$@"

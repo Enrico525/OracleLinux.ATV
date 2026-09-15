@@ -1,5 +1,5 @@
 USO DE IA - Enrico
 
-- Usei o ChatGPT para resumir um texto que estava na pesquisa feita pelo Vitor
+- Usei o ChatGPT para resumir um texto que estava na pesquisa feita pelo Victor
 - Perguntei o que era o Kpatch
 - pedi a explicação do licenciamento do oraclelinux para comparar com a pesquisa
